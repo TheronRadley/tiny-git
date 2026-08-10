@@ -1,0 +1,33 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+.eggs/
+
+# Unit test / coverage reports
+.pytest_cache/
+.coverage
+htmlcov/
+*.cover
+
+# Environments
+.env
+.venv
+venv/
+ENV/
+
+# Repository directories created during manual testing
+demo/
+.tinygit/
+test_tmp*/
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
