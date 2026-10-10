@@ -277,6 +277,7 @@ See [`docs/branching.md`](docs/branching.md) and [`docs/merging.md`](docs/mergin
 | [`docs/failure-model.md`](docs/failure-model.md) | Crash consistency and corruption behaviour |
 | [`docs/repository-lifecycle.md`](docs/repository-lifecycle.md) | End-to-end lifecycle walkthrough |
 | [`docs/development.md`](docs/development.md) | Local setup, running tests, debugging the object store |
+| [`docs/social-preview.png`](docs/social-preview.png) | 1280×640 Open Graph banner, uploaded under **Settings → General → Social preview** |
 
 ---
 
