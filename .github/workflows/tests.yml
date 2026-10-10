@@ -6,12 +6,20 @@ on:
   pull_request:
     branches: [main]
 
+# Cancel superseded runs on the same ref so the badge reflects the newest commit.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
-    runs-on: ubuntu-latest
+    name: pytest / ruff / mypy (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.12", "3.13"]
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
 
     steps:
       - name: Check out repository
@@ -41,3 +49,36 @@ jobs:
         if: success()
         run: |
           mypy src
+
+  # Windows is deliberately NON-BLOCKING while the POSIX permission-bit tests are
+  # ported. Known blockers, all in the executable-file-mode round-trip:
+  #   - tests/test_symlink_encoding.py asserts `st_mode & 0o111`
+  #   - tests/test_merge_adversarial.py asserts `st_mode & stat.S_IXUSR`
+  #   - tests/test_merge_abort_brutal.py compares st_mode across a merge
+  #   - tests/test_state_machine.py toggles 0o755/0o644 as a fuzz action
+  # `os.chmod` on Windows only flips the read-only bit, so the exec bit never
+  # round-trips. Promote this job into the blocking matrix once those tests skip
+  # on platforms without POSIX mode bits.
+  windows:
+    name: pytest (windows-latest, py3.12) [non-blocking]
+    runs-on: windows-latest
+    continue-on-error: true
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run pytest test suite
+        run: |
+          pytest -v

@@ -38,7 +38,7 @@ We do not add features merely to make the repository look larger. Every line of 
 
 ## 3. Code Standards & Typing
 
-- **Python Version**: Write modern Python 3.12+.
+- **Python Version**: Write modern Python that runs on every version in `pyproject.toml`'s `requires-python` range. The CI matrix (`.github/workflows/tests.yml`) is the source of truth — if you use a feature newer than the lowest supported version, raise the floor there and in `pyproject.toml` together, in the same commit.
 - **Type Hints**: Use complete type hints (`from __future__ import annotations`, explicit return types, explicit parameter types).
 - **No Traceback Dumps**: Custom error classes in `tinygit.errors` must provide human-readable descriptions.
 - **No TODO or Placeholder Code**: Do not leave `# TODO implement later`, `pass`, or `raise NotImplementedError` in production code.
@@ -49,10 +49,13 @@ We do not add features merely to make the repository look larger. Every line of 
 
 - Every new feature or bugfix **must** include tests in `tests/`.
 - Never write tests that write to `/tmp` directly or mutate the global filesystem; always use pytest's `tmp_path` fixture.
-- Run the full test suite before submitting a Pull Request:
+- Run everything CI will run before submitting a Pull Request:
   ```bash
   pytest -v
+  ruff check src tests
+  mypy src
   ```
+  CI fails the build on any of the three, so a green `pytest` alone is not enough.
 
 ---
 
