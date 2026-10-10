@@ -1,0 +1,12 @@
+# tiny-git stores blobs byte-for-byte and its tests assert exact byte content
+# (see tests/test_symlink_encoding.py), so never let Git rewrite line endings.
+* text=auto eol=lf
+
+# Binary assets: never diff, never normalise.
+*.png binary
+*.jpg binary
+*.gif binary
+*.cast binary
+
+# Shell scripts must keep LF even when checked out on Windows.
+*.sh text eol=lf

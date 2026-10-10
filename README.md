@@ -8,9 +8,22 @@
              └────────────────────────────────────────────────────────┘
 ```
 
-**[Python 3.12+]  [License: MIT]  [Tests: 98 Passed (0 Failed)]  [CLI Commands: 16 (Frozen)]**
+[![Tests](https://github.com/TheronRadley/tiny-git/actions/workflows/tests.yml/badge.svg)](https://github.com/TheronRadley/tiny-git/actions/workflows/tests.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.10%20|%203.11%20|%203.12%20|%203.13-blue.svg)](pyproject.toml)
 
-`tiny-git` (`tiny-git`) is a small, cleanly designed open-source version-control system built from scratch in modern Python 3.12+. It implements content-addressed objects, a staging index, immutable commits, references, branching, unified diffs, and three-way merges without invoking Git.
+`tiny-git` is a small, cleanly designed version-control system built from scratch in modern Python. It implements content-addressed objects, a staging index, immutable commits, references, branching, unified diffs, and three-way merges — without ever invoking Git.
+
+> ### Why `tiny-git` and `tinygit`?
+>
+> They are the same project spelled two ways, because Python packaging and Python imports disagree about hyphens.
+>
+> | Where | Name | Why |
+> | :--- | :--- | :--- |
+> | PyPI distribution, `pip install`, the command you type | **`tiny-git`** | Hyphens read naturally in a project name and on a command line. |
+> | Importable Python package (`src/tinygit/`) | **`tinygit`** | A hyphen is not a legal character in a Python identifier, so `import tiny-git` is impossible. |
+>
+> In practice: `pip install tiny-git`, run `tiny-git init` in your shell, and `from tinygit.repository import Repository` in your code.
 
 ---
 
@@ -28,60 +41,27 @@ We explicitly prioritize:
 1. **Correctness & Invariants**: Strict content-addressed invariants, atomic filesystem operations, and safe checkout/merge semantics that protect uncommitted work.
 2. **Repository Integrity**: Comprehensive integrity checking (`tiny-git fsck`), crash consistency, and format versioning.
 3. **Simplicity**: Small, sharply separated modules with clear data structures and no magic.
-4. **Testability**: 98 tests covering unit behavior, property invariants, crash consistency, a 30+ scenario merge matrix, and full CLI workflows in isolated temporary directories.
+4. **Testability**: A test suite covering unit behavior, property invariants, crash consistency, a large merge scenario matrix, and full CLI workflows in isolated temporary directories. See [`docs/testing.md`](docs/testing.md).
 5. **No Fake Completeness**: Every feature claimed in this README works in code and is verified by tests.
-
----
-
-## Key Architectural & Reliability Features
-
-```
-      Working Tree           Index (Staging Area)           Object Database
-      (Disk Files)           (.tinygit/index)            (.tinygit/objects/)
-
-     ┌────────────┐            ┌────────────┐              ┌────────────┐
-     │            │  add       │            │  commit      │            │
-     │  main.py   ├───────────►│  main.py   ├─────────────►│  Blob      │
-     │  README.md │            │  README.md │  (build      │  Tree      │
-     │            │            │            │   tree)      │  Commit    │
-     └─────▲──────┘            └─────▲──────┘              └─────▲──────┘
-           │                         │                           │
-           │                         │                           │
-           └─────────────────────────┴───────────────────────────┘
-                    checkout / merge (restore snapshots)
-```
-
-- **Content-Addressable Object Store (`.tinygit/objects/`)**:
-  - Implements SHA-1 content-addressed storage with deduplication for Blobs, Trees, and Commits, using standard `xx/yyyy...` two-character prefix directory sharding.
-  - **Security & Algorithm Extension Point**: SHA-1 is used explicitly to mirror Git's historical object model for educational clarity, not for modern cryptographic collision resistance. The store is decoupled via the `HashAlgorithm` enum and `get_hasher()` abstraction, allowing future algorithms (like SHA-256) without rewriting storage logic.
-- **Repository Integrity Checker (`tiny-git fsck`)**:
-  - Validates object hashes, tree entry references, parent commit existence, ref validity, HEAD target integrity, index blob existence, and commit graph acyclicity.
-- **Atomic File Writes (`atomic_write_file`)**:
-  - Metadata and object files (`HEAD`, `refs`, `index`, `config`, `objects/`) are written using temporary files, `os.fsync()`, and atomic renames to prevent partial file corruption on process crash or power loss.
-- **Format Versioning (`core.repositoryformatversion`)**:
-  - Stores `repositoryformatversion = 1` in `.tinygit/config`. Rejects newer versions safely with an `UnsupportedRepositoryFormatError`.
-- **Symlink & Byte-Oriented Storage Policy**:
-  - Symlinks are explicitly unsupported in V1 for security and determinism; filesystem traversals never follow or stage symlink targets.
-  - Blobs are strictly byte-oriented (`read_bytes()` / `write_bytes()`), supporting binary files and arbitrary character encodings safely.
-- **Revision Resolver (`RevisionResolver`)**:
-  - Unified resolution engine for `HEAD`, branches, short SHA prefixes, and ancestry syntax (`HEAD~1`, `HEAD^`, `main~2^2`).
 
 ---
 
 ## Installation
 
 ### Prerequisites
-- Python 3.12 or higher
+- Python 3.10 or higher (see [`pyproject.toml`](pyproject.toml) for the supported floor)
 
 ### Installing from Source (Editable Mode)
 
 Clone the repository and install it in editable mode using `pip`:
 
 ```bash
-git clone https://github.com/example/tiny-git.git
+git clone https://github.com/TheronRadley/tiny-git.git
 cd tiny-git
-pip install -e .
+pip install -e ".[dev]"
 ```
+
+Drop `.[dev]` for a plain install; the `dev` extra adds `pytest`, `ruff`, and `mypy`.
 
 Verify the installation:
 
@@ -91,7 +71,7 @@ tiny-git --help
 
 ---
 
-## Quick Start & Demo
+## Quick Start
 
 ```bash
 mkdir demo
@@ -113,21 +93,30 @@ tiny-git commit -m "Initial commit"
 echo "world" >> hello.txt
 tiny-git diff
 
-# Stage and commit
+# Stage, commit, inspect, and verify
 tiny-git add hello.txt
 tiny-git commit -m "Update greeting"
-
-# Inspect commit log
 tiny-git log --oneline
-
-# Verify repository integrity
 tiny-git fsck
 ```
 
-### Sample Output from `tiny-git fsck`
-```
+Sample output from the run above:
+
+```console
+$ tiny-git diff
+--- a/hello.txt
++++ b/hello.txt
+@@ -1 +1,2 @@
+ hello
++world
+
+$ tiny-git log --oneline
+b9d7d97 Update greeting
+2758798 Initial commit
+
+$ tiny-git fsck
 Checking repository...
-✓ 3 objects checked
+✓ 6 objects checked
 ✓ 1 refs checked
 ✓ HEAD valid
 ✓ index valid
@@ -138,7 +127,7 @@ Repository is healthy.
 
 ---
 
-## The 16 Core CLI Commands (Frozen V1.0 Surface)
+## The 16 Core CLI Commands (Frozen V1 Surface)
 
 Every command is implemented in `tinygit.cli` and executable via `tiny-git <command> [options]`:
 
@@ -186,48 +175,25 @@ Every command is implemented in `tinygit.cli` and executable via `tiny-git <comm
 
 ## Architecture
 
-`tiny-git` follows a strictly layered architecture to separate user input parsing from version-control domain logic and filesystem serialization:
-
 ```
-                  ┌─────────────────────────────────────────┐
-                  │              CLI Layer                  │  (cli.py, __main__.py)
-                  │  • Argument parsing (argparse)          │
-                  │  • Human-readable error formatting      │
-                  └────────────────────┬────────────────────┘
-                                       │
-                  ┌────────────────────▼────────────────────┐
-                  │          Repository Layer               │  (repository.py, config.py)
-                  │  • Central facade (Repository class)    │
-                  │  • Enforces format version & invariants │
-                  └────────┬───────────┬───────────┬────────┘
-                           │           │           │
-      ┌────────────────────┼───────────┴───────────┼────────────────────┐
-      ▼                    ▼                       ▼                    ▼
-┌───────────┐      ┌───────────────┐       ┌───────────────┐    ┌───────────────┐
-│ Status &  │      │  Branching &  │       │  Merge & Diff │    │ Working Tree  │
-│ Working   │      │  Refs Logic   │       │    Engine     │    │   I/O & Safe  │
-│ Tree Diff │      │   (refs.py)   │       │(merge/diff.py)│    │   Checkout    │
-└─────┬─────┘      └───────┬───────┘       └───────┬───────┘    └───────┬───────┘
-      │                    │                       │                    │
-      └────────────────────┼───────────────────────┴────────────────────┘
-                           ▼
-                  ┌─────────────────────────────────────────┐
-                  │          Staging Area / Index           │  (index.py)
-                  │  • Structured JSON index (.tinygit/index)│
-                  └────────────────────┬────────────────────┘
-                                       │
-                  ┌────────────────────▼────────────────────┐
-                  │      Content-Addressable Storage        │  (objects.py)
-                  │  • SHA-1 digest ("<type> <size>\0...")  │
-                  │  • Blob, Tree, Commit serialization     │
-                  └────────────────────┬────────────────────┘
-                                       │
-                  ┌────────────────────▼────────────────────┐
-                  │          Local Filesystem               │  (.tinygit/objects/xx/yy...)
-                  └─────────────────────────────────────────┘
+      Working Tree           Index (Staging Area)           Object Database
+      (Disk Files)           (.tinygit/index)            (.tinygit/objects/)
+
+     ┌────────────┐            ┌────────────┐              ┌────────────┐
+     │            │  add       │            │  commit      │            │
+     │  main.py   ├───────────►│  main.py   ├─────────────►│  Blob      │
+     │  README.md │            │  README.md │  (build      │  Tree      │
+     │            │            │            │   tree)      │  Commit    │
+     └─────▲──────┘            └─────▲──────┘              └─────▲──────┘
+           │                         │                           │
+           │                         │                           │
+           └─────────────────────────┴───────────────────────────┘
+                    checkout / merge (restore snapshots)
 ```
 
-For detailed architectural diagrams, see [`docs/architecture.md`](docs/architecture.md).
+`tiny-git` follows a strictly layered architecture: `cli.py` parses arguments, `repository.py` is the facade that enforces format versions and invariants, and the subsystems below it (`status.py`, `refs.py`, `merge.py`, `diff.py`, `working_tree.py`, `index.py`, `objects.py`) each own one concern. Metadata and object writes go through `atomic_write_file` — temporary file, `os.fsync()`, atomic rename — so a crash mid-write cannot leave half a file behind.
+
+The full layer diagram, module responsibilities, and data-flow walkthroughs live in [`docs/architecture.md`](docs/architecture.md).
 
 ---
 
@@ -250,6 +216,19 @@ For detailed architectural diagrams, see [`docs/architecture.md`](docs/architect
 - **`Commit`**: Root Tree snapshot, 0..N parents, author identity, timestamp, and message.
 
 See [`docs/object-model.md`](docs/object-model.md) and [`docs/storage.md`](docs/storage.md) for full serialization specifications.
+
+### ⚠️ Not wire-compatible with real Git
+
+**Real `git` cannot read a `.tinygit` repository, and `tiny-git` cannot read a `.git` one.** The on-disk *formats* deliberately differ so the files stay human-readable:
+
+| Component | `tiny-git` | Real `git` |
+| :--- | :--- | :--- |
+| Tree objects | UTF-8 text lines, `mode sha name\n` | Binary, `mode name\0` + 20 raw digest bytes |
+| Loose objects | Stored uncompressed | zlib-deflated |
+| Index (`.tinygit/index`) | JSON | Custom binary format |
+| Repository directory | `.tinygit/` | `.git/` |
+
+What *is* intentionally shared is the conceptual layer — the `<type> <size>\0<content>` SHA-1 hashing scheme, `xx/yyyy...` sharding, `ref: refs/heads/<branch>` HEAD syntax, `~N`/`^N` ancestry syntax, unified-diff formatting, and `<<<<<<< HEAD` conflict markers. So the ideas transfer directly to Git; the bytes do not. See [`docs/git-comparison.md`](docs/git-comparison.md).
 
 ---
 
@@ -282,84 +261,53 @@ See [`docs/branching.md`](docs/branching.md) and [`docs/merging.md`](docs/mergin
 
 ---
 
-## The 8 Fundamental Repository Invariants
+## Documentation Index
 
-`tiny-git` is built around an explicit engineering specification defined in [`docs/invariants.md`](docs/invariants.md):
-
-| # | Invariant | Enforcement Mechanism | Verifying Test Suite |
-| :-: | :--- | :--- | :--- |
-| **1** | **Object Reachability** | Every referenced object ID must exist in `.tinygit/objects/`. | `test_fsck.py`, `test_state_machine.py` |
-| **2** | **Object Immutability** | Written objects are never overwritten; hash checksums are verified on read. | `test_invariants.py`, `test_fsck_adversarial.py` |
-| **3** | **Branch Reference Validity** | Branch files must store 40-character hex strings pointing to valid commits. | `test_branch.py`, `test_invariants.py` |
-| **4** | **HEAD Consistency** | `.tinygit/HEAD` stores either a valid symbolic ref or a detached SHA-1. | `test_checkout.py`, `test_fsck.py` |
-| **5** | **Commit Tree Existence** | Every Commit's root `tree` header must reference an existing Tree object. | `test_invariants.py`, `test_fsck.py` |
-| **6** | **Tree Hierarchy Integrity** | Every Tree entry must reference an existing valid Blob or Tree object. | `test_checkout_topology.py`, `test_fsck.py` |
-| **7** | **Worktree Data Protection** | Checkouts and merges never overwrite uncommitted edits or untracked files. | `test_checkout.py`, `test_merge.py`, `test_merge_abort_brutal.py` |
-| **8** | **Atomic Filesystem Durability** | Metadata writes use temp files, `os.fsync()`, and atomic rename (`.replace()`). | `test_atomic_crash_safety.py`, `test_state_machine.py` |
-
----
-
-## Testing & Verification
-
-`tiny-git` has an extensive test suite built with `pytest` where every test uses an isolated temporary directory (`tmp_path`):
-
-```bash
-pytest -v
-```
-
-### Test Suite Summary (`98 Passed / 0 Failed`)
-1. **Unit Tests**: Object hashing, blob deduplication, JSON index serialization, reference management, diff generation, revision resolution, fsck diagnostics, `cat-file`/`show` inspection, `rm`/`restore` behaviors.
-2. **Property & Invariant Tests (`test_invariants.py`)**:
-   - Same content -> same SHA-1 ID; different content -> different SHA-1 ID.
-   - Commit hash uniqueness under message/author/tree changes.
-   - Branch isolation invariance.
-   - Exact snapshot reproduction on checkout.
-   - Clean merge union invariance.
-3. **Crash Consistency & Atomic Writes (`test_atomic_crash_safety.py`)**:
-   - Verifies zero temporary file leakage on write, format version rejection, and `fsck` corruption detection.
-4. **Comprehensive Merge Matrix (`test_merge_matrix.py`, `test_merge_adversarial_v2.py`, `test_merge_abort_brutal.py`)**:
-   - Over 25 dedicated test functions testing 30+ scenarios: adjacent line edits, identical edits, overlapping conflict hunk injection, modify/delete conflicts, delete/modify conflicts, binary file collisions, empty files, criss-cross DAG LCA ancestor resolution, and exact pre-merge state restoration on abort.
-5. **State-Machine Fuzzer (`test_state_machine.py`)**:
-   - Runs 10 distinct random seeds x 100 operations each (1,000 total operations) across files, staging, commits, branches, checkouts, and merges, asserting all 8 invariants after every step.
-6. **End-to-End Workflow & CLI Contract Tests (`test_end_to_end.py`, `test_cli_contract.py`)**:
-   - Complete lifecycle verification across Python `Repository` API and live CLI subprocess execution, auditing error messages, non-zero exit codes, and zero tracebacks.
-7. **Static Analysis**:
-   - `ruff check src tests`: **0 errors** (`All checks passed!`).
-   - `mypy src`: **0 errors** (`Success: no issues found in 16 source files`).
+| Document | What it covers |
+| :--- | :--- |
+| [`docs/architecture.md`](docs/architecture.md) | Layer diagram, module responsibilities, data flow |
+| [`docs/invariants.md`](docs/invariants.md) | The 8 fundamental repository invariants and how each is enforced |
+| [`docs/object-model.md`](docs/object-model.md) | Blob, Tree, and Commit schemas |
+| [`docs/storage.md`](docs/storage.md) | On-disk layout, sharding, atomic write protocol |
+| [`docs/branching.md`](docs/branching.md) | Refs, HEAD, detached HEAD |
+| [`docs/merging.md`](docs/merging.md) | LCA search, 3-way merge, conflict handling |
+| [`docs/testing.md`](docs/testing.md) | What the test suite covers and how to run it |
+| [`docs/benchmarks.md`](docs/benchmarks.md) | Measured scaling numbers and the exact conditions they were taken under |
+| [`docs/git-comparison.md`](docs/git-comparison.md) | Where `tiny-git` matches Git and where it diverges |
+| [`docs/failure-model.md`](docs/failure-model.md) | Crash consistency and corruption behaviour |
+| [`docs/repository-lifecycle.md`](docs/repository-lifecycle.md) | End-to-end lifecycle walkthrough |
+| [`docs/development.md`](docs/development.md) | Local setup, running tests, debugging the object store |
 
 ---
 
-## Performance Benchmarking (`benchmarks/run_benchmarks.py`)
+## Correctness at a Glance
 
-`tiny-git` includes an automated benchmark suite verifying linear $O(N)$ execution scaling without quadratic filesystem bottlenecks:
+`tiny-git` is built around eight explicit engineering invariants — object reachability, object immutability, branch reference validity, HEAD consistency, commit tree existence, tree hierarchy integrity, worktree data protection, and atomic filesystem durability.
 
-```bash
-python3 benchmarks/run_benchmarks.py
-```
+The full table of invariants, their enforcement points, and the test suites that verify each one is in **[`docs/invariants.md`](docs/invariants.md)**.
 
-### Measured Execution Times (ms)
-| Operation | 100 Files | 1,000 Files | 2,500 Files | Scaling Behavior |
-| :--- | :---: | :---: | :---: | :---: |
-| **`init`** | 1.16 ms | 1.23 ms | 0.96 ms | $O(1)$ |
-| **`add .`** | 35.46 ms | 345.97 ms | 806.34 ms | $O(N)$ |
-| **`commit`** | 1.33 ms | 6.08 ms | 13.71 ms | $O(N)$ |
-| **`status`** | 16.80 ms | 150.05 ms | 374.86 ms | $O(N)$ |
-| **`diff`** | 21.24 ms | 191.54 ms | 478.00 ms | $O(N)$ |
-| **`checkout`** | 18.63 ms | 177.00 ms | 435.75 ms | $O(N)$ |
-| **`fsck`** | 18.16 ms | 156.09 ms | 369.77 ms | $O(N)$ |
+Verification is continuous rather than aspirational: the [Tests workflow](https://github.com/TheronRadley/tiny-git/actions/workflows/tests.yml) runs `pytest`, `ruff check src tests`, and `mypy src` on every push and pull request across the supported Python versions and operating systems. The badge at the top of this README is that workflow's live status. See [`docs/testing.md`](docs/testing.md) for what the suite covers.
 
 ---
 
 ## Roadmap
 
 - **v1.0.0 (Current Frozen Release)**:
-  - 16 Core CLI commands: `init`, `config`, `add`, `commit`, `status`, `log`, `branch`, `checkout`, `diff`, `merge`, `fsck`, `cat-file`, `show`, `rev-parse`, `rm`, `restore`.
-  - Correctness hardening: atomic `fsync` writes, `core.repositoryformatversion = 1`, `tiny-git fsck`, safe checkouts, `merge --abort`, 98 automated tests.
+  - 16 core CLI commands: `init`, `config`, `add`, `commit`, `status`, `log`, `branch`, `checkout`, `diff`, `merge`, `fsck`, `cat-file`, `show`, `rev-parse`, `rm`, `restore`.
+  - Correctness hardening: atomic `fsync` writes, `core.repositoryformatversion = 1`, `tiny-git fsck`, safe checkouts, `merge --abort`.
 - **v1.1 — Reference Extensions & Maintenance (Planned)**:
   - `tiny-git tag` (lightweight and annotated tags in `.tinygit/refs/tags/`).
   - `tiny-git count-objects` and reachability analysis.
   - `tiny-git gc --dry-run` and `tiny-git prune --dry-run`.
 - **v2.0 — Remote Protocols (Future Exploration)**: Simple HTTP/SSH loose-object transfer (`clone`, `fetch`, `push`, `pull`).
+
+See [`CHANGELOG.md`](CHANGELOG.md) for what shipped in each release.
+
+---
+
+## Contributing
+
+Bug reports, feature requests, and pull requests are welcome — please read [`CONTRIBUTING.md`](CONTRIBUTING.md) first. This project follows a [Code of Conduct](CODE_OF_CONDUCT.md) and has a [security disclosure policy](SECURITY.md).
 
 ---
 
