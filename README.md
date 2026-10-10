@@ -287,7 +287,11 @@ See [`docs/branching.md`](docs/branching.md) and [`docs/merging.md`](docs/mergin
 
 The full table of invariants, their enforcement points, and the test suites that verify each one is in **[`docs/invariants.md`](docs/invariants.md)**.
 
-Verification is continuous rather than aspirational: the [Tests workflow](https://github.com/TheronRadley/tiny-git/actions/workflows/tests.yml) runs `pytest`, `ruff check src tests`, and `mypy src` on every push and pull request across the supported Python versions and operating systems. The badge at the top of this README is that workflow's live status. See [`docs/testing.md`](docs/testing.md) for what the suite covers.
+Verification is continuous rather than aspirational: the [Tests workflow](https://github.com/TheronRadley/tiny-git/actions/workflows/tests.yml) runs `pytest`, `ruff check src tests`, and `mypy src` on every push and pull request across Python 3.10–3.13 on Ubuntu and macOS. The badge at the top of this README is that workflow's live status.
+
+**Windows is not yet supported.** A Windows job runs on every push but is deliberately marked non-blocking: `os.chmod()` only flips the read-only bit there, so the executable-file-mode round-trip tests in `test_symlink_encoding.py`, `test_merge_adversarial.py`, `test_merge_abort_brutal.py`, and `test_state_machine.py` cannot pass. The workflow file names those call sites; once they skip on platforms without POSIX mode bits, the job moves into the blocking matrix.
+
+See [`docs/testing.md`](docs/testing.md) for what the suite covers.
 
 ---
 
