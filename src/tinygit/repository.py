@@ -6,27 +6,39 @@ branch, checkout, merge, diff, config) and enforces safety invariants.
 
 from __future__ import annotations
 
+import functools
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, TypeVar
 
 from tinygit.config import ConfigManager
 from tinygit.diff import DiffEngine, FileChange
 from tinygit.errors import (
+    IgnoredPathError,
     InvalidPathError,
     InvalidReferenceError,
+    LockHeldError,
     NothingToCommitError,
     RepositoryAlreadyExistsError,
     RepositoryNotFoundError,
     UnsupportedRepositoryFormatError,
+    WorkingTreeDirtyError,
 )
 from tinygit.fsck import FsckResult, IntegrityChecker
 from tinygit.index import Index
+from tinygit.locking import LockError, operation_lock
 from tinygit.merge import MergeEngine, MergeResult
 from tinygit.objects import Blob, Commit, ObjectStore, Tree
-from tinygit.refs import ReferenceManager
+from tinygit.refs import ReferenceManager, ReflogEntry
 from tinygit.resolver import RevisionResolver
 from tinygit.status import StatusResult, StatusService
-from tinygit.utils import format_log_date, get_timestamp
+from tinygit.utils import (
+    format_log_date,
+    get_timestamp,
+    is_path_ignored,
+    load_ignore_patterns,
+)
 from tinygit.working_tree import WorkingTree
 
 
@@ -59,6 +71,29 @@ class CommitLogEntry:
         return "\n".join(lines)
 
 
+_T = TypeVar("_T")
+
+
+def _serialized(fn: Callable[..., _T]) -> Callable[..., _T]:
+    """Serialise a mutating repository operation against other tiny-git processes.
+
+    Each of these methods reads metadata, mutates it in memory, and writes it
+    back. Without a lock held across all three steps, two concurrent commands
+    each write their own version of the index or a branch and one of the updates
+    is silently lost.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(self: Any, *args: Any, **kwargs: Any) -> _T:
+        try:
+            with operation_lock(self.repo_root):
+                return fn(self, *args, **kwargs)
+        except LockError as e:
+            raise LockHeldError(e.lock_path) from e
+
+    return wrapper
+
+
 class Repository:
     """High-level repository manager representing a Tiny Git repository (.tinygit/)."""
 
@@ -74,10 +109,15 @@ class Repository:
 
     def _validate_format_version(self) -> None:
         version_str = self.config.get("core.repositoryformatversion", "1")
+        if version_str is None:
+            return
         try:
-            version = int(version_str) if version_str is not None else 1
+            version = int(version_str)
         except ValueError:
-            version = 1
+            # A malformed version is not the same as version 1. Silently
+            # treating it as supported would let a truncated or hand-edited
+            # config open a repository whose layout this code cannot interpret.
+            raise UnsupportedRepositoryFormatError(version_str) from None
         if version > 1:
             raise UnsupportedRepositoryFormatError(version)
 
@@ -118,10 +158,15 @@ class Repository:
             curr = curr.parent
         raise RepositoryNotFoundError(str(start_path))
 
-    def add(self, paths: list[str]) -> list[str]:
+    @_serialized
+    def add(self, paths: list[str], force: bool = False) -> list[str]:
         """Stage file changes (additions, modifications, and deletions) in the index."""
         self.index.read()
-        disk_files = set(self.wt.list_files())
+        # Tracked files stay visible even if .tinygitignore now matches them, so
+        # that `add .` updates them instead of silently staging a deletion.
+        tracked = {e.path for e in self.index.list_entries()}
+        disk_files = set(self.wt.list_files(always_include=tracked))
+        ignore_patterns = load_ignore_patterns(self.repo_root)
         head_commit_sha = self.refs.get_head_commit()
         head_map: dict[str, tuple[str, str]] = {}
         if head_commit_sha:
@@ -174,6 +219,13 @@ class Repository:
                     if posix_p in disk_files:
                         self._stage_file(posix_p)
                         staged_paths.append(posix_p)
+                    elif target_path.is_file() and is_path_ignored(posix_p, ignore_patterns):
+                        # Present on disk, untracked, and matched by
+                        # .tinygitignore. A silent skip would look like success.
+                        if not force:
+                            raise IgnoredPathError(posix_p)
+                        self._stage_file(posix_p)
+                        staged_paths.append(posix_p)
                     elif posix_p in self.index or posix_p in head_map:
                         self.index.remove(posix_p)
                         staged_paths.append(posix_p)
@@ -194,6 +246,7 @@ class Repository:
         self.index.add(rel_path, sha, mode=mode, size=size, mtime=mtime)
         return sha
 
+    @_serialized
     def commit(self, message: str, allow_empty: bool = False) -> str:
         """Create a new commit from the staging area (index)."""
         if not message.strip():
@@ -241,7 +294,9 @@ class Repository:
             message=message.strip(),
         )
         commit_sha = self.store.write_object(c)
-        self.refs.update_head_commit(commit_sha)
+        # Guarded: if another process moved HEAD between the read above and now,
+        # fail instead of overwriting its commit.
+        self.refs.update_head_commit(commit_sha, expected=head_commit_sha)
 
         if merge_head_path.exists():
             try:
@@ -255,6 +310,13 @@ class Repository:
                 pass
 
         return commit_sha
+
+    def reflog(self, max_count: int | None = None) -> list[ReflogEntry]:
+        """Return HEAD reflog entries, newest last, optionally limited to the last N."""
+        entries = self.refs.read_reflog()
+        if max_count is not None and max_count > 0:
+            return entries[-max_count:]
+        return entries
 
     def status(self) -> StatusResult:
         """Get repository status comparing HEAD -> INDEX -> WORKING TREE."""
@@ -298,6 +360,7 @@ class Repository:
 
         return entries
 
+    @_serialized
     def branch(self, name: str | None = None) -> list[tuple[str, bool]] | str:
         """List branches or create a new branch."""
         if name is None:
@@ -311,9 +374,46 @@ class Repository:
             self.refs.create_branch(name, head_commit_sha)
             return name
 
-    def checkout(self, target: str) -> str:
-        """Checkout a branch or commit after ensuring working tree safety."""
+    def merge_in_progress(self) -> str | None:
+        """Return the MERGE_HEAD commit sha if a merge is underway, else None."""
+        merge_head_path = self.tinygit_dir / "MERGE_HEAD"
+        if not merge_head_path.exists():
+            return None
+        try:
+            value = merge_head_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        return value or None
+
+    def _assert_no_merge_in_progress(self, action: str) -> None:
+        """Refuse to start a new operation while an unresolved merge is pending.
+
+        MERGE_HEAD is the only record that the next commit has two parents. An
+        operation that moves HEAD or starts a second merge while it exists
+        silently discards that record, leaving a commit that looks like an
+        ordinary one-parent commit even though a merge was in flight.
+        """
+        if self.merge_in_progress() is not None:
+            raise WorkingTreeDirtyError(
+                f"You have not concluded your merge (MERGE_HEAD exists). "
+                f"Commit it with 'tiny-git commit' or discard it with "
+                f"'tiny-git merge --abort' before running {action}."
+            )
+
+    @_serialized
+    def checkout(self, target: str, force: bool = False) -> str:
+        """Checkout a branch or commit after ensuring working tree safety.
+
+        With ``force``, the safety check is skipped and the working tree and
+        index are made to match the target exactly. This is the recovery path
+        for an operation that failed part-way through its apply phase: the
+        snapshot it was aiming at is still intact in the object store, so
+        re-materialising HEAD's tree always gets back to a known state. It
+        destroys uncommitted work and must never be the default.
+        """
         self.index.read()
+        if not force:
+            self._assert_no_merge_in_progress("checkout")
         target_commit_sha = self.refs.get_ref_commit(target)
         if not target_commit_sha:
             raise InvalidReferenceError(target)
@@ -325,7 +425,7 @@ class Repository:
             head_commit = self.store.read_commit(head_commit_sha)
             head_tree_sha = head_commit.tree_id
 
-        self.wt.checkout_tree(target_commit.tree_id, head_tree_sha, self.index, self.store, force=False)
+        self.wt.checkout_tree(target_commit.tree_id, head_tree_sha, self.index, self.store, force=force)
 
         if self.refs.branch_exists(target):
             self.refs.set_head_to_branch(target)
@@ -334,6 +434,7 @@ class Repository:
             self.refs.set_head_to_commit(target_commit_sha)
             return f"Note: switching to '{target_commit_sha[:7]}'.\nYou are in 'detached HEAD' state."
 
+    @_serialized
     def merge(self, target_branch: str | None = None, abort: bool = False) -> MergeResult | str:
         """Merge target_branch into current HEAD branch using 3-way merge, or abort current merge."""
         self.index.read()
@@ -356,6 +457,8 @@ class Repository:
 
         if not target_branch:
             raise InvalidReferenceError("No branch specified for merge")
+
+        self._assert_no_merge_in_progress("another merge")
 
         name, email = self.config.get_user_info()
         res = MergeEngine.merge(target_branch, self.refs, self.index, self.wt, self.store, name, email)
@@ -448,14 +551,50 @@ class Repository:
             lines.append(diff_str)
         return "\n".join(lines)
 
-    def rm(self, paths: list[str], cached: bool = False) -> list[str]:
-        """Remove files from the index (staged deletion), optionally deleting from disk."""
+    @_serialized
+    def rm(self, paths: list[str], cached: bool = False, force: bool = False) -> list[str]:
+        """Remove files from the index (staged deletion), optionally deleting from disk.
+
+        Without ``force``, refuses to delete a working tree file that carries
+        work not present in HEAD -- either staged content that differs from
+        HEAD, or local modifications. Such a deletion is unrecoverable: the
+        bytes exist nowhere else. ``--cached`` only touches the index, so it is
+        never destructive and needs no override.
+
+        Every path is validated before anything is removed, so a bad argument
+        cannot leave a partial removal behind.
+        """
         self.index.read()
-        removed = []
-        for p in paths:
-            posix_p = Path(p).as_posix()
+
+        head_sha = self.refs.get_head_commit()
+        head_map: dict[str, tuple[str, str]] = {}
+        if head_sha:
+            head_map = self.wt.get_tree_entries_flat(self.store.read_commit(head_sha).tree_id, self.store)
+
+        planned = [(original, Path(original).as_posix()) for original in paths]
+
+        # ---- Validate the whole plan first. ----
+        for original, posix_p in planned:
             if posix_p not in self.index:
-                raise InvalidPathError(p, "Path is not in index")
+                raise InvalidPathError(original, "Path is not in index")
+
+        if not cached and not force:
+            for _original, posix_p in planned:
+                head_sha_for_path = head_map[posix_p][0] if posix_p in head_map else None
+                entry = self.index.query(posix_p)
+                if entry is not None and entry.object_id != head_sha_for_path:
+                    raise WorkingTreeDirtyError(
+                        f"file '{posix_p}' has staged content different from HEAD (use --force to remove it anyway)"
+                    )
+                disk_state = self.wt.get_file_state(posix_p)
+                if disk_state is not None and disk_state[0] != head_sha_for_path:
+                    raise WorkingTreeDirtyError(
+                        f"file '{posix_p}' has local modifications (use --force to remove it anyway)"
+                    )
+
+        # ---- Apply. ----
+        removed = []
+        for _original, posix_p in planned:
             self.index.remove(posix_p)
             removed.append(posix_p)
             if not cached:
@@ -463,6 +602,7 @@ class Repository:
         self.index.write()
         return sorted(removed)
 
+    @_serialized
     def restore(self, paths: list[str], staged: bool = False) -> list[str]:
         """Restore working tree files from index (or unstage index files from HEAD)."""
         self.index.read()

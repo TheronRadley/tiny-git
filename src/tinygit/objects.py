@@ -9,12 +9,13 @@ Implements SHA-1 content-addressed objects:
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
 from tinygit.errors import InvalidObjectError, ObjectNotFoundError
-from tinygit.utils import atomic_write_file
+from tinygit.utils import METADATA_DIR_NAMES, atomic_write_file
 
 
 class HashAlgorithm(Enum):
@@ -89,6 +90,34 @@ class Blob(GitObject):
         return self.data == other.data
 
 
+# Modes a tree entry may carry. Symlinks (120000) and gitlinks (160000) are
+# deliberately unsupported in V1; see docs/git-comparison.md.
+VALID_TREE_MODES = frozenset({"100644", "100755", "040000"})
+
+_SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def validate_tree_entry_name(name: str) -> str:
+    """Validate a single tree entry name and return it unchanged.
+
+    A tree entry name is one path component, never a path. The tree text format
+    is ``<mode> <sha> <name>\n``, so a name containing a newline silently
+    corrupts every following entry, and a name containing a separator would let
+    a crafted tree write outside the directory it names.
+    """
+    if not name:
+        raise InvalidObjectError("tree", "Empty tree entry name")
+    if name in (".", ".."):
+        raise InvalidObjectError("tree", f"Traversal tree entry name: {name!r}")
+    if "/" in name or "\\" in name:
+        raise InvalidObjectError("tree", f"Tree entry name contains a path separator: {name!r}")
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in name):
+        raise InvalidObjectError("tree", f"Tree entry name contains a control character: {name!r}")
+    if name in METADATA_DIR_NAMES:
+        raise InvalidObjectError("tree", f"Tree entry name is reserved metadata: {name!r}")
+    return name
+
+
 @dataclass(order=True)
 class TreeEntry:
     """An entry in a tree object (file or directory)."""
@@ -96,6 +125,14 @@ class TreeEntry:
     mode: str
     name: str
     object_id: str
+
+    def validate(self) -> None:
+        """Validate this entry's mode, name, and object id."""
+        validate_tree_entry_name(self.name)
+        if self.mode not in VALID_TREE_MODES:
+            raise InvalidObjectError("tree", f"Unsupported tree entry mode: {self.mode!r}")
+        if not _SHA1_RE.match(self.object_id):
+            raise InvalidObjectError("tree", f"Invalid object id in tree entry {self.name!r}: {self.object_id!r}")
 
 
 class Tree(GitObject):
@@ -105,6 +142,21 @@ class Tree(GitObject):
 
     def __init__(self, entries: list[TreeEntry] | None = None) -> None:
         self.entries = sorted(entries or [], key=lambda e: e.name)
+        self.validate_entries()
+
+    def validate_entries(self) -> None:
+        """Validate every entry and reject duplicate names.
+
+        Duplicates make a tree ambiguous -- two blobs claim the same path -- so
+        they are rejected on both construction and parse rather than being
+        silently resolved by last-write-wins.
+        """
+        seen: set[str] = set()
+        for entry in self.entries:
+            entry.validate()
+            if entry.name in seen:
+                raise InvalidObjectError("tree", f"Duplicate tree entry name: {entry.name!r}")
+            seen.add(entry.name)
 
     def serialize(self) -> bytes:
         lines = []
@@ -114,14 +166,17 @@ class Tree(GitObject):
 
     @classmethod
     def parse(cls, data: bytes) -> Tree:
-        text = data.decode("utf-8")
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError as e:
+            raise InvalidObjectError("tree", f"Tree payload is not valid UTF-8: {e}") from e
         entries = []
         for line in text.splitlines():
             if not line.strip():
                 continue
             parts = line.split(" ", 2)
             if len(parts) != 3:
-                raise InvalidObjectError("unknown", f"Invalid tree entry format: {line}")
+                raise InvalidObjectError("tree", f"Invalid tree entry format: {line}")
             mode, sha, name = parts
             entries.append(TreeEntry(mode=mode, name=name, object_id=sha))
         return cls(entries)

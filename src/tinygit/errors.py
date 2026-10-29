@@ -93,6 +93,22 @@ class InvalidPathError(TinyGitError):
         self.path = path
 
 
+class IgnoredPathError(TinyGitError):
+    """Raised when an explicitly named path is matched by .tinygitignore.
+
+    Silently skipping the path would make `add <file>` look like it worked while
+    staging nothing, so the refusal is explicit and names the file to retry with
+    --force.
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        super().__init__(
+            f"The following path is ignored by .tinygitignore: {path}\n"
+            "Use 'tiny-git add --force' if you really mean to track it."
+        )
+
+
 class ConfigurationError(TinyGitError):
     """Raised when configuration is missing or invalid."""
 
@@ -102,10 +118,14 @@ class ConfigurationError(TinyGitError):
 
 
 class UnsupportedRepositoryFormatError(TinyGitError):
-    """Raised when opening a repository with a format version newer than supported."""
+    """Raised when opening a repository whose format version is unsupported or malformed."""
 
-    def __init__(self, version: int) -> None:
-        super().__init__(f"Unsupported Tiny Git repository format version: {version} (this version supports up to 1)")
+    def __init__(self, version: int | str) -> None:
+        if isinstance(version, int):
+            detail = f"version: {version} (this version supports up to 1)"
+        else:
+            detail = f"version is malformed: {version!r}"
+        super().__init__(f"Unsupported Tiny Git repository format {detail}")
         self.version = version
 
 
@@ -117,9 +137,30 @@ class RevisionNotFoundError(TinyGitError):
         self.rev = rev
 
 
+class StaleReferenceError(TinyGitError):
+    """Raised when a guarded reference update finds the ref changed underneath it."""
+
+    def __init__(self, ref_name: str, expected: str | None, actual: str | None) -> None:
+        super().__init__(
+            f"Reference '{ref_name}' changed while it was being updated "
+            f"(expected {expected or 'absent'}, found {actual or 'absent'})"
+        )
+        self.ref_name = ref_name
+
+
+class LockHeldError(TinyGitError):
+    """Raised when a repository lock is held by another tiny-git process."""
+
+    def __init__(self, lock_path: str) -> None:
+        super().__init__(
+            f"Unable to create '{lock_path}': another tiny-git process is running. "
+            f"If no other process is running, delete the stale lock file."
+        )
+        self.lock_path = lock_path
+
+
 class CorruptRepositoryError(TinyGitError):
     """Raised when repository fsck detects corruption or missing objects."""
 
     def __init__(self, message: str) -> None:
         super().__init__(f"Repository corruption detected: {message}")
-

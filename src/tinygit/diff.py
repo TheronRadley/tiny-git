@@ -53,6 +53,11 @@ class FileChange:
 
         diff_lines = list(difflib.unified_diff(old_lines, new_lines, fromfile=fromfile, tofile=tofile))
         if not diff_lines:
+            # Content is identical but the mode is not: a mode-only change has
+            # no hunks, so report it the way git does rather than printing
+            # nothing and making the change invisible.
+            if self.old_mode != self.new_mode and self.old_mode and self.new_mode:
+                return f"diff --git a/{self.path} b/{self.path}\nold mode {self.old_mode}\nnew mode {self.new_mode}\n"
             return ""
         # Ensure trailing newline
         diff_str = "".join(diff_lines)
@@ -65,14 +70,12 @@ class DiffEngine:
     """Service for computing diffs between snapshots."""
 
     @staticmethod
-    def diff_worktree_index(
-        repo_root: Path, index: Index, wt: WorkingTree, store: ObjectStore
-    ) -> list[FileChange]:
+    def diff_worktree_index(repo_root: Path, index: Index, wt: WorkingTree, store: ObjectStore) -> list[FileChange]:
         """Compute diff between Working Tree and Index (tiny-git diff)."""
         changes = []
-        disk_files = set(wt.list_files())
+        disk_files = set(wt.list_files(always_include=[e.path for e in index.list_stage0_entries()]))
 
-        for entry in index.list_entries():
+        for entry in index.list_stage0_entries():
             path = entry.path
             old_blob = store.read_blob(entry.object_id)
             old_content = old_blob.data
@@ -90,8 +93,9 @@ class DiffEngine:
                     )
                 )
             else:
-                disk_sha = wt.get_file_sha1(path)
-                if disk_sha != entry.object_id:
+                disk_state = wt.get_file_state(path)
+                disk_sha = disk_state[0] if disk_state else None
+                if disk_state is not None and disk_state != (entry.object_id, entry.mode):
                     new_content = wt.read_file(path)
                     changes.append(
                         FileChange(
@@ -124,7 +128,7 @@ class DiffEngine:
             head_map = wt.get_tree_entries_flat(commit_obj.tree_id, store)
 
         index_map: dict[str, tuple[str, str]] = {
-            entry.path: (entry.object_id, entry.mode) for entry in index.list_entries()
+            entry.path: (entry.object_id, entry.mode) for entry in index.list_stage0_entries()
         }
 
         all_paths = set(head_map.keys()) | set(index_map.keys())

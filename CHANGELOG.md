@@ -7,6 +7,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+A full audit of the codebase against the invariants the documentation already
+claimed. Every item below is covered by a regression test that was verified to
+fail against the pre-fix code.
+
+### Security
+
+- **Branch names are validated everywhere they are used to build a path.** An
+  absolute or traversal-containing branch name (`/tmp/pwned`, `a/../../escape`)
+  previously wrote a ref file outside the repository; committing on a malicious
+  initial branch could overwrite an external file. `init -b` is covered too.
+- **Tree entries are validated before checkout, at both construction and parse
+  time.** A crafted tree could previously plant `.tinygit/hooks/post-checkout`.
+  Entry names containing a separator, traversal, a metadata directory, or an
+  empty name are now rejected as `InvalidObjectError`.
+- **`is_ignored()` no longer treats every `.git`-prefixed name as metadata.**
+  `.gitignore`, `.github/`, and `.gitattributes` were silently excluded from
+  `add .`.
+- **Filenames that the index format cannot represent are rejected at staging
+  time** rather than producing a tree that cannot be read back.
+
+### Fixed
+
+- **`checkout` of the current branch no longer destroys work.** It reverted
+  unstaged edits and deleted newly staged files; it now preserves both.
+- **An unreadable tree is no longer treated as an empty snapshot.** A checkout
+  targeting a missing tree deleted every tracked file and still moved `HEAD`.
+- **`rm` refuses to discard uncommitted edits** unless `--force` is given.
+- **The merge index is rebuilt from the merge result.** A clean 3-way merge
+  deleted files from disk while keeping them in the resulting commit.
+- **Conflict stages are correct.** Conflicted paths had a spurious stage 0 and
+  zero hashes were written for nonexistent sides, which broke `diff` and `fsck`
+  on a perfectly valid add/add conflict.
+- **Arbitrary bytes survive a merge.** Non-UTF-8 content was rewritten with
+  replacement characters even when the merge reported success; undecodable
+  content is now treated as binary.
+- **Merge-base selection is ancestry-based, not distance-based.** The old
+  heuristic returned a non-maximal common ancestor in 34 of 394 randomly
+  generated DAGs; multiple merge bases are now detected and handled explicitly.
+- **Executable-bit changes are real changes.** Mode-only edits are now reported
+  by `status` and `diff`, carried through `merge` and `checkout`, and `restore`
+  clears an exec bit instead of leaving it set.
+- **Paths given on the command line resolve relative to the caller's
+  directory**, so `tiny-git add file` from a subdirectory stages that file.
+- **`fsck` validates far more**: referent object types, index/stage consistency,
+  `HEAD` commit types, malformed and newer `repositoryformatversion` values, and
+  unsafe names anywhere in a flattened tree path.
+
+### Added
+
+- **Operation locking.** `FileLock` with stale-lock recovery serialises mutating
+  commands, and ref updates are compare-and-swap, so concurrent writers cannot
+  lose commits.
+- **Recoverable failures.** Mutating operations validate their whole plan before
+  touching disk, propagate filesystem errors instead of swallowing them, and
+  `fsync` parent directories after metadata renames.
+- **`tiny-git checkout --force`** re-materialises a revision's tree, which is the
+  recovery path after an interrupted checkout or merge.
+- **`.tinygitignore`** with documented gitignore-lite semantics, plus explicit
+  tracked-file behaviour and an `add --force` override.
+- **`tiny-git reflog [-n N]`** backed by `.tinygit/logs/HEAD`.
+- **`tiny-git status --short` and `--porcelain`.**
+- **Merge lifecycle enforcement**: while a merge is in progress, `checkout` and a
+  second `merge` are refused until the merge is committed or aborted.
+
+### Changed
+
+- **Development status is `4 - Beta`, not `5 - Production/Stable`.** The
+  classifier was aspirational; this audit found reachable data-loss and
+  repository-corruption bugs in released code.
+- **Crash-safety claims are narrowed.** `atomic_write_file` still guarantees a
+  per-file atomic replacement, and now fsyncs the containing directory as well.
+  There is no journal, so a command interrupted *between* writes is not
+  recoverable automatically. [`docs/failure-model.md`](docs/failure-model.md)
+  states the boundary explicitly.
+
+---
+
 ## [1.0.0] - 2026-10-10
 
 First tagged release. The 16-command V1 surface is frozen — see the

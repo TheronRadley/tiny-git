@@ -45,57 +45,100 @@ class MergeResult:
         return self.status in ("up-to-date", "fast-forward", "clean")
 
 
+def _resolve_mode(
+    lca_val: tuple[str, str] | None,
+    head_val: tuple[str, str] | None,
+    target_val: tuple[str, str] | None,
+) -> str:
+    """Pick the file mode for a merged path using the same three-way rule as content.
+
+    Comparing (sha, mode) tuples elsewhere means a mode-only change reaches this
+    function with identical content on both sides. Taking HEAD's mode
+    unconditionally would silently drop a change to the executable bit made on
+    the branch being merged in.
+    """
+    lca_mode = lca_val[1] if lca_val else None
+    head_mode = head_val[1] if head_val else None
+    target_mode = target_val[1] if target_val else None
+
+    if head_mode == target_mode:
+        return head_mode or target_mode or "100644"
+    if lca_mode is not None and head_mode == lca_mode:
+        return target_mode or head_mode or "100644"
+    if lca_mode is not None and target_mode == lca_mode:
+        return head_mode or target_mode or "100644"
+    return head_mode or target_mode or "100644"
+
+
 class MergeEngine:
     """Engine for performing three-way merges between branches."""
 
     @staticmethod
-    def find_lca(commit_sha1: str, commit_sha2: str, store: ObjectStore) -> str | None:
-        """Find the Lowest Common Ancestor (LCA) commit of two commits."""
-        if commit_sha1 == commit_sha2:
-            return commit_sha1
-
-        # Collect all ancestors of sha1 with BFS
-        ancestors_1: dict[str, int] = {}
-        queue: list[tuple[str, int]] = [(commit_sha1, 0)]
+    def _ancestors_inclusive(commit_sha: str, store: ObjectStore) -> set[str]:
+        """Return commit_sha together with every commit reachable from it."""
+        seen: set[str] = set()
+        queue = [commit_sha]
         while queue:
-            curr, depth = queue.pop(0)
-            if curr in ancestors_1:
+            curr = queue.pop()
+            if curr in seen:
                 continue
-            ancestors_1[curr] = depth
+            seen.add(curr)
             try:
                 obj = store.read_commit(curr)
-                for p in obj.parents:
-                    queue.append((p, depth + 1))
             except Exception:
-                pass
-
-        # BFS from sha2 to find first commit in ancestors_1
-        queue2: list[tuple[str, int]] = [(commit_sha2, 0)]
-        visited_2: set[str] = set()
-        best_lca: str | None = None
-        best_depth = float("inf")
-
-        while queue2:
-            curr, depth = queue2.pop(0)
-            if curr in visited_2:
                 continue
-            visited_2.add(curr)
+            queue.extend(obj.parents)
+        return seen
 
-            if curr in ancestors_1:
-                tot_depth = depth + ancestors_1[curr]
-                if tot_depth < best_depth:
-                    best_depth = tot_depth
-                    best_lca = curr
-                continue
+    @classmethod
+    def find_merge_bases(cls, commit_sha1: str, commit_sha2: str, store: ObjectStore) -> list[str]:
+        """Return every maximal common ancestor of two commits, sorted.
 
-            try:
-                obj = store.read_commit(curr)
-                for p in obj.parents:
-                    queue2.append((p, depth + 1))
-            except Exception:
-                pass
+        "Maximal" means no other common ancestor is a descendant of it. This is
+        ancestry-based rather than distance-based: picking the common ancestor
+        with the smallest summed graph distance can return an *older* commit
+        when the two branches happen to be unequal lengths from a newer common
+        ancestor, which makes the merge diff against too old a base.
 
-        return best_lca
+        A criss-cross history legitimately has more than one merge base. The
+        list is sorted so callers pick the same one every run.
+        """
+        if commit_sha1 == commit_sha2:
+            return [commit_sha1]
+
+        ancestors_1 = cls._ancestors_inclusive(commit_sha1, store)
+        ancestors_2 = cls._ancestors_inclusive(commit_sha2, store)
+        common = ancestors_1 & ancestors_2
+        if not common:
+            return []
+
+        # A common ancestor is maximal when no *other* common ancestor sits
+        # above it -- that is, when it is not a strict ancestor of any other
+        # member of the set. Ancestry is cached per commit: without the cache
+        # this is O(n^2) graph walks.
+        ancestry_cache: dict[str, set[str]] = {}
+
+        def strict_ancestors(sha: str) -> set[str]:
+            if sha not in ancestry_cache:
+                ancestry_cache[sha] = cls._ancestors_inclusive(sha, store) - {sha}
+            return ancestry_cache[sha]
+
+        maximal: list[str] = []
+        for candidate in common:
+            shadowed = any(candidate in strict_ancestors(other) for other in common if other != candidate)
+            if not shadowed:
+                maximal.append(candidate)
+        return sorted(maximal)
+
+    @classmethod
+    def find_lca(cls, commit_sha1: str, commit_sha2: str, store: ObjectStore) -> str | None:
+        """Find a Lowest Common Ancestor (LCA) commit of two commits.
+
+        When the history has several equally valid merge bases this returns the
+        first in sorted order, so the result is deterministic across runs.
+        """
+        bases = cls.find_merge_bases(commit_sha1, commit_sha2, store)
+        return bases[0] if bases else None
 
     @classmethod
     def _merge_3way_lines(
@@ -189,11 +232,32 @@ class MergeEngine:
 
         return result_lines, has_conflict
 
+    @staticmethod
+    def _as_text(data: bytes | None) -> str | None:
+        """Decode bytes as UTF-8, or return None when they are not valid text.
+
+        Decoding with errors="replace" and re-encoding is not round-trip safe:
+        non-UTF-8 bytes such as Latin-1 text turn into U+FFFD and the merge then
+        reports success while having silently rewritten the file. Anything that
+        does not decode is handled as binary instead.
+        """
+        if data is None:
+            return None
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+
     @classmethod
     def merge_3way_text(
         cls, a_bytes: bytes | None, b_bytes: bytes | None, c_bytes: bytes | None, target_branch: str
     ) -> tuple[bytes, bool]:
-        """Three-way merge of file bytes, returning (merged_bytes, has_conflict)."""
+        """Three-way merge of file bytes, returning (merged_bytes, has_conflict).
+
+        The returned bytes are always byte-exact copies of one of the inputs, or
+        a merge assembled only from inputs that decoded cleanly as UTF-8. No
+        path through this function can alter bytes it was given.
+        """
         if b_bytes == c_bytes:
             return (b_bytes or b"", False)
 
@@ -203,24 +267,37 @@ class MergeEngine:
         if a_bytes == c_bytes:
             return (b_bytes or b"", False)
 
-        # One side deleted, one side modified
+        # One side deleted, one side modified. Keep our bytes untouched and
+        # report a conflict; conflict markers cannot be injected into content
+        # that is not text.
         if b_bytes is None and c_bytes is not None:
-            c_text = c_bytes.decode("utf-8", errors="replace")
-            conflict_str = f"<<<<<<< HEAD\n=======\n{c_text}>>>>>>> {target_branch}\n"
+            c_side = cls._as_text(c_bytes)
+            if c_side is None:
+                return (b"", True)
+            conflict_str = f"<<<<<<< HEAD\n=======\n{c_side}>>>>>>> {target_branch}\n"
             return (conflict_str.encode("utf-8"), True)
 
         if c_bytes is None and b_bytes is not None:
-            b_text = b_bytes.decode("utf-8", errors="replace")
-            conflict_str = f"<<<<<<< HEAD\n{b_text}=======\n>>>>>>> {target_branch}\n"
+            b_side = cls._as_text(b_bytes)
+            if b_side is None:
+                return (b_bytes, True)
+            conflict_str = f"<<<<<<< HEAD\n{b_side}=======\n>>>>>>> {target_branch}\n"
             return (conflict_str.encode("utf-8"), True)
 
+        a_text = cls._as_text(a_bytes or b"")
+        b_text = cls._as_text(b_bytes or b"")
+        c_text = cls._as_text(c_bytes or b"")
+
+        # Not valid UTF-8, or contains NUL bytes: cannot inline text conflict
+        # markers, so keep our side byte-for-byte and flag the conflict.
+        if a_text is None or b_text is None or c_text is None:
+            return (b_bytes or b"", True)
         if is_binary_bytes(b_bytes or b"") or is_binary_bytes(c_bytes or b""):
-            # Cannot inline text conflict markers into binary files
             return (b_bytes or b"", True)
 
-        a_lines = (a_bytes or b"").decode("utf-8", errors="replace").splitlines(keepends=True)
-        b_lines = (b_bytes or b"").decode("utf-8", errors="replace").splitlines(keepends=True)
-        c_lines = (c_bytes or b"").decode("utf-8", errors="replace").splitlines(keepends=True)
+        a_lines = a_text.splitlines(keepends=True)
+        b_lines = b_text.splitlines(keepends=True)
+        c_lines = c_text.splitlines(keepends=True)
 
         res_lines, has_conflict = cls._merge_3way_lines(a_lines, b_lines, c_lines, target_branch)
         return ("".join(res_lines).encode("utf-8"), has_conflict)
@@ -292,6 +369,8 @@ class MergeEngine:
 
         conflicts: list[Conflict] = []
         merged_map: dict[str, tuple[str, str]] = {}
+        # path -> (base_sha | None, our_sha | None, their_sha | None, mode)
+        conflict_sides: dict[str, tuple[str | None, str | None, str | None, str]] = {}
 
         for path in all_paths:
             lca_val = lca_map.get(path)
@@ -322,7 +401,7 @@ class MergeEngine:
 
             merged_bytes, has_conflict = cls.merge_3way_text(lca_bytes, head_bytes, target_bytes, target_branch)
 
-            mode = head_val[1] if head_val else (target_val[1] if target_val else "100644")
+            mode = _resolve_mode(lca_val, head_val, target_val)
 
             if has_conflict:
                 conflicts.append(
@@ -333,13 +412,18 @@ class MergeEngine:
                         target_content=target_bytes,
                     )
                 )
-                # Write conflict markers to disk and stage them with conflict stages (1, 2, 3)
+                # Record the conflict marker blob for the working tree, and keep
+                # the three sides for the index. A side that does not exist is
+                # recorded as None and omitted, never as an all-zero object id.
                 blob = Blob(merged_bytes)
                 new_sha = store.write_object(blob)
                 merged_map[path] = (new_sha, mode)
-                index.add(path, lca_val[0] if lca_val else ("0" * 40), mode=mode, stage=1)
-                index.add(path, head_val[0] if head_val else ("0" * 40), mode=mode, stage=2)
-                index.add(path, target_val[0] if target_val else ("0" * 40), mode=mode, stage=3)
+                conflict_sides[path] = (
+                    lca_val[0] if lca_val else None,
+                    head_val[0] if head_val else None,
+                    target_val[0] if target_val else None,
+                    mode,
+                )
             else:
                 if merged_bytes or (head_val or target_val):
                     blob = Blob(merged_bytes)
@@ -353,25 +437,61 @@ class MergeEngine:
                 if full_path.exists() and path not in index:
                     raise WorkingTreeDirtyError(f"Untracked working tree file '{path}' would be overwritten by merge.")
 
-        # Update working directory and index with merged results (including conflict markers if any)
-        # Remove files that are not in merged_map
-        for path in sorted(head_map.keys()):
-            if path not in merged_map:
-                wt.remove_file(path)
+        # A path that is a prefix of another path in the result means one side
+        # turned a file into a directory (or back). Writing both would fail
+        # halfway through, so report it as a conflict instead of corrupting the
+        # working tree.
+        result_paths = set(merged_map)
+        for path in sorted(result_paths):
+            head_part = ""
+            for component in path.split("/")[:-1]:
+                head_part = f"{head_part}/{component}" if head_part else component
+                if head_part in result_paths:
+                    conflicts.append(
+                        Conflict(
+                            path=path,
+                            reason=f"file/directory conflict with '{head_part}'",
+                            head_content=None,
+                            target_content=None,
+                        )
+                    )
+                    merged_map.pop(path, None)
+                    break
 
-        # Write merged files to disk
-        for path, (sha, mode) in merged_map.items():
-            blob_data = store.read_blob(sha).data
-            wt.write_file(path, blob_data, mode=mode)
+        # ---- Phase 1: plan. Resolve every payload before touching the tree. ----
+        doomed = (set(head_map) | {e.path for e in index.list_entries()}) - set(merged_map)
+        to_remove = sorted(doomed)
+        to_write = sorted(merged_map)
 
-        # Rebuild index for clean entries (stage 0)
-        for path, (sha, mode) in sorted(merged_map.items()):
-            if any(c.path == path for c in conflicts):
-                continue
+        payloads: dict[str, tuple[bytes, str]] = {}
+        for path in to_write:
+            sha, mode = merged_map[path]
+            payloads[path] = (store.read_blob(sha).data, mode)
+
+        # ---- Phase 2: apply. ----
+        for path in to_remove:
+            wt.remove_file(path)
+        for path in to_write:
+            data, mode = payloads[path]
+            wt.write_file(path, data, mode=mode)
+
+        # Rebuild the index from the actual merged result rather than patching
+        # the pre-merge index. Patching left entries behind for files the merge
+        # deleted from disk, so the resulting commit contained files that no
+        # longer existed in the working tree.
+        index.clear()
+        for path in to_write:
+            sha, mode = merged_map[path]
             full_path = wt.repo_root / path
             size = full_path.stat().st_size if full_path.exists() else 0
             mtime = full_path.stat().st_mtime if full_path.exists() else 0.0
             index.add(path, sha, mode=mode, size=size, mtime=mtime, stage=0)
+
+        # Record conflict stages last: adding a stage 0 entry clears stages 1-3,
+        # so conflicted paths must be converted after the clean rebuild.
+        for path, (base, ours, theirs, mode) in conflict_sides.items():
+            if path in merged_map:
+                index.set_conflict_stages(path, base, ours, theirs, mode=mode)
         index.write()
 
         if conflicts:
