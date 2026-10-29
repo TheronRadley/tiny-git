@@ -39,7 +39,7 @@ Our killer feature is simple:
 
 We explicitly prioritize:
 1. **Correctness & Invariants**: Strict content-addressed invariants, atomic filesystem operations, and safe checkout/merge semantics that protect uncommitted work.
-2. **Repository Integrity**: Comprehensive integrity checking (`tiny-git fsck`), crash consistency, and format versioning.
+2. **Repository Integrity**: Comprehensive integrity checking (`tiny-git fsck`), per-file atomic writes, a HEAD reflog, and format versioning.
 3. **Simplicity**: Small, sharply separated modules with clear data structures and no magic.
 4. **Testability**: A test suite covering unit behavior, property invariants, crash consistency, a large merge scenario matrix, and full CLI workflows in isolated temporary directories. See [`docs/testing.md`](docs/testing.md).
 5. **No Fake Completeness**: Every feature claimed in this README works in code and is verified by tests.
@@ -152,24 +152,52 @@ Every command is implemented in `tinygit.cli` and executable via `tiny-git <comm
 - **`tiny-git config <key> [<value>]`**: Gets or sets repository configuration in `.tinygit/config`.
 
 ### Staging & Working Tree Modification
-- **`tiny-git add <files>...`**: Stages files, directories, or all changes/deletions (`.`) in `.tinygit/index`.
-- **`tiny-git rm <files>... [--cached]`**: Stages file deletions. Use `--cached` to remove from `.tinygit/index` while leaving the working tree file untouched.
+- **`tiny-git add <files>... [-f]`**: Stages files, directories, or all changes/deletions (`.`) in `.tinygit/index`. Files matched by `.tinygitignore` are skipped when staging a directory; naming one explicitly is refused unless `-f` is given, so `add` never looks like it worked while staging nothing.
+- **`tiny-git rm <files>... [--cached] [--force]`**: Stages file deletions. Use `--cached` to remove from `.tinygit/index` while leaving the working tree file untouched. A file with uncommitted edits is refused unless `--force` is given.
 - **`tiny-git restore <files>... [--staged]`**: Restores working tree files from index (default) or unstages index modifications from `HEAD` (`--staged`).
 - **`tiny-git commit -m "<message>" [--allow-empty]`**: Creates an immutable snapshot from the staging area.
 
 ### Inspection & Debugging
-- **`tiny-git status`**: Compares `HEAD -> Index -> Working Tree` to report staged, unstaged, unmerged, and untracked changes.
+- **`tiny-git status [-s | --porcelain]`**: Compares `HEAD -> Index -> Working Tree` to report staged, unstaged, unmerged, and untracked changes. `-s` prints a compact two-column summary; `--porcelain` prints stable `XY <path>` lines for scripts.
 - **`tiny-git log [--oneline] [-n <max-count>]`**: Traverses parent chains to format commit logs matching Git.
 - **`tiny-git diff [--cached]`**: Generates unified diffs (`--- a/file` / `+++ b/file`) for unstaged or staged changes.
 - **`tiny-git show [<rev>]`**: Displays commit metadata and unified diff against its first parent.
 - **`tiny-git cat-file <object> [-t | -s | -p]`**: Low-level object database inspection. Show type (`-t`), size (`-s`), or pretty-printed content (`-p`).
 - **`tiny-git rev-parse <rev>`**: Resolves revision expressions (`HEAD~1`, `main`, short SHAs) to a full 40-character SHA-1.
 - **`tiny-git fsck`**: Checks repository integrity, object references, index blobs, and commit graph acyclicity.
+- **`tiny-git reflog [-n <max-count>]`**: Prints the `HEAD` movement log from `.tinygit/logs/HEAD`, so a commit that no branch points at can still be named and recovered.
 
 ### Branching & Merging
 - **`tiny-git branch [<name>]`**: Lists branches (indicating current branch with `*`) or creates a new branch pointing to HEAD.
-- **`tiny-git checkout <target>`**: Safely switches branches or checks out commit SHAs (detached HEAD) without overwriting uncommitted work.
-- **`tiny-git merge <branch> [--abort]`**: Executes fast-forward merges or true 3-way line merges, reporting clean convergence or conflict marker files. Use `--abort` to discard a conflicted merge and restore pre-merge state.
+- **`tiny-git checkout <target> [-f]`**: Safely switches branches or checks out commit SHAs (detached HEAD) without overwriting uncommitted work. `-f` discards local changes and re-materialises the target tree exactly, which is also the recovery path after a checkout or merge was interrupted part-way through.
+- **`tiny-git merge <branch> [--abort]`**: Executes fast-forward merges or true 3-way line merges, reporting clean convergence or conflict marker files. Use `--abort` to discard a conflicted merge and restore pre-merge state. While a merge is in progress, `checkout` and a second `merge` are refused: resolve and commit, or abort, before switching branches.
+
+### Ignoring files: `.tinygitignore`
+
+Place a `.tinygitignore` at the repository root to keep generated files out of
+`add .`, `status`, and `diff`. It supports a small, documented subset of
+gitignore:
+
+| Pattern | Matches |
+| --- | --- |
+| `*.pyc` | `mod.pyc`, `pkg/mod.pyc` — no slash means match the basename at any depth |
+| `/root.txt` | `root.txt` only — a leading slash anchors to the repository root |
+| `docs/*.md` | `docs/a.md` but not `docs/sub/a.md` — a slash in the middle also anchors, and `*` never crosses a directory separator |
+| `build/` | everything below a `build` directory, at any depth |
+| `**` | crosses directory separators, unlike `*` |
+| `!keep.log` | re-includes a path an earlier pattern excluded |
+
+`#` starts a comment and blank lines are ignored. The last matching pattern
+wins, so negations must come after the rule they cancel.
+
+Two behaviours are worth spelling out, because both are easy to get wrong:
+
+- **A tracked file is never un-tracked by a later rule.** If `data.log` is
+  already committed and you then add `*.log`, `add .` stages your *modification*
+  to it rather than staging a deletion, and `checkout` still restores it.
+- **Naming an ignored file explicitly is refused, not silently skipped.**
+  `tiny-git add build.log` prints an error naming the rule and exits non-zero;
+  add `-f` if you really mean to track it.
 
 ---
 
@@ -191,7 +219,7 @@ Every command is implemented in `tinygit.cli` and executable via `tiny-git <comm
                     checkout / merge (restore snapshots)
 ```
 
-`tiny-git` follows a strictly layered architecture: `cli.py` parses arguments, `repository.py` is the facade that enforces format versions and invariants, and the subsystems below it (`status.py`, `refs.py`, `merge.py`, `diff.py`, `working_tree.py`, `index.py`, `objects.py`) each own one concern. Metadata and object writes go through `atomic_write_file` — temporary file, `os.fsync()`, atomic rename — so a crash mid-write cannot leave half a file behind.
+`tiny-git` follows a strictly layered architecture: `cli.py` parses arguments, `repository.py` is the facade that enforces format versions and invariants, and the subsystems below it (`status.py`, `refs.py`, `merge.py`, `diff.py`, `working_tree.py`, `index.py`, `objects.py`) each own one concern. Metadata and object writes go through `atomic_write_file` — temporary file, `os.fsync()`, atomic rename, then an `fsync` of the containing directory — so a crash mid-write cannot leave half a file behind. Note that this guarantee is per file: `tiny-git` has no journal, so a command interrupted *between* writes can leave the working tree and the references out of step. [`docs/failure-model.md`](docs/failure-model.md) states precisely what is and is not covered, and how to recover.
 
 The full layer diagram, module responsibilities, and data-flow walkthroughs live in [`docs/architecture.md`](docs/architecture.md).
 

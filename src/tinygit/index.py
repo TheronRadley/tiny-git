@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from tinygit.errors import InvalidObjectError, InvalidPathError
-from tinygit.utils import atomic_write_file
+from tinygit.utils import atomic_write_file, validate_relative_path
 
 
 @dataclass
@@ -49,11 +49,10 @@ class IndexEntry:
 
     def validate(self) -> None:
         """Validate index entry invariants."""
-        if not self.path or "/" in self.path[:1] or "\\" in self.path:
-            raise InvalidObjectError("index", f"Invalid path in index: {self.path}")
-        parts = self.path.split("/")
-        if ".tinygit" in parts or ".." in parts or "." in parts:
-            raise InvalidObjectError("index", f"Disallowed path component in index: {self.path}")
+        try:
+            validate_relative_path(self.path)
+        except InvalidPathError as e:
+            raise InvalidObjectError("index", f"Invalid path in index: {e.message}") from e
         if self.mode not in ("100644", "100755", "040000"):
             raise InvalidObjectError("index", f"Invalid file mode in index: {self.mode}")
         if not re.match(r"^[0-9a-fA-F]{40}$", self.object_id):
@@ -119,8 +118,9 @@ class Index:
     ) -> None:
         """Add or update a file entry in the index at a specific stage (0=normal, 1-3=conflict)."""
         posix_path = Path(path).as_posix()
-        if posix_path.startswith("/") or ".tinygit" in posix_path.split("/") or ".." in posix_path.split("/"):
-            raise InvalidPathError(path, "Disallowed path in index staging")
+        validate_relative_path(posix_path)
+        if stage not in (0, 1, 2, 3):
+            raise InvalidPathError(path, f"Invalid index stage: {stage}")
         entry = IndexEntry(
             path=posix_path,
             object_id=object_id,
@@ -130,11 +130,39 @@ class Index:
             stage=stage,
         )
         entry.validate()
-        # Adding a normal stage 0 entry clears any conflicting entries (stage 1, 2, 3) for that path
+        # Stage 0 and the conflict stages are mutually exclusive: a path is
+        # either resolved (stage 0) or conflicted (a subset of 1, 2, 3). Leaving
+        # both in place makes the path look simultaneously resolved and
+        # conflicted to status, diff, fsck, and tree building.
         if stage == 0:
             for st in (1, 2, 3):
                 self._entries.pop((posix_path, st), None)
+        else:
+            self._entries.pop((posix_path, 0), None)
         self._entries[(posix_path, stage)] = entry
+
+    def set_conflict_stages(
+        self,
+        path: str,
+        base: str | None,
+        ours: str | None,
+        theirs: str | None,
+        mode: str = "100644",
+    ) -> None:
+        """Record a conflicted path using only the stages that actually exist.
+
+        A side that does not exist is omitted rather than recorded as an
+        all-zero object id. A zero hash is not an object: it passes the
+        40-hex-digit shape check, so it survives index validation and then
+        makes `fsck` report a missing blob and `diff` fail to read it.
+        """
+        posix_path = Path(path).as_posix()
+        self._entries.pop((posix_path, 0), None)
+        for st in (1, 2, 3):
+            self._entries.pop((posix_path, st), None)
+        for stage, object_id in ((1, base), (2, ours), (3, theirs)):
+            if object_id is not None:
+                self.add(posix_path, object_id, mode=mode, stage=stage)
 
     def remove(self, path: str, stage: int | None = None) -> bool:
         """Remove a file entry from the index. If stage is None, removes all stages for path."""
@@ -171,6 +199,16 @@ class Index:
     def list_entries(self) -> list[IndexEntry]:
         """Return all staged entries sorted by (path, stage)."""
         return [self._entries[key] for key in sorted(self._entries.keys())]
+
+    def list_stage0_entries(self) -> list[IndexEntry]:
+        """Return only resolved (stage 0) entries, sorted by path.
+
+        Status, diff, and tree building all describe the *next commit*, which is
+        defined by stage 0 alone. Iterating every stage instead would report a
+        conflicted path several times over and pick an arbitrary stage as its
+        content.
+        """
+        return [e for key, e in sorted(self._entries.items()) if key[1] == 0]
 
     def has_unmerged_paths(self) -> bool:
         """Check if any entries are unmerged (stage > 0)."""

@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 from tinygit.diff import DiffEngine
-from tinygit.errors import TinyGitError
+from tinygit.errors import InvalidPathError, TinyGitError
 from tinygit.repository import Repository
 
 
@@ -41,6 +41,12 @@ def build_parser() -> argparse.ArgumentParser:
     # add
     add_parser = subparsers.add_parser("add", help="Add file contents to the index (staging area)")
     add_parser.add_argument("files", nargs="+", help="Files or directories to stage (use '.' for all)")
+    add_parser.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help="Allow adding a file explicitly named but matched by .tinygitignore",
+    )
 
     # commit
     commit_parser = subparsers.add_parser("commit", help="Record changes to the repository")
@@ -52,7 +58,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # status
-    subparsers.add_parser("status", help="Show the working tree status")
+    status_parser = subparsers.add_parser("status", help="Show the working tree status")
+    status_parser.add_argument(
+        "-s", "--short", dest="short", action="store_true", help="Show a compact two-column summary"
+    )
+    status_parser.add_argument(
+        "--porcelain",
+        action="store_true",
+        help="Show machine-readable `XY <path>` output suitable for scripts",
+    )
 
     # log
     log_parser = subparsers.add_parser("log", help="Show commit logs")
@@ -71,6 +85,12 @@ def build_parser() -> argparse.ArgumentParser:
     # checkout
     checkout_parser = subparsers.add_parser("checkout", help="Switch branches or restore working tree files")
     checkout_parser.add_argument("target", help="Branch name or commit SHA-1 prefix to checkout")
+    checkout_parser.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help="Discard local changes and make the working tree match the target exactly",
+    )
 
     # merge
     merge_parser = subparsers.add_parser("merge", help="Join two or more development histories together")
@@ -98,6 +118,10 @@ def build_parser() -> argparse.ArgumentParser:
     config_parser = subparsers.add_parser("config", help="Get and set repository or global options")
     config_parser.add_argument("key", help="Configuration key (e.g., user.name)")
     config_parser.add_argument("value", nargs="?", default=None, help="Value to set")
+
+    # reflog
+    reflog_parser = subparsers.add_parser("reflog", help="Show the HEAD reference log, for recovering from bad resets")
+    reflog_parser.add_argument("-n", "--max-count", type=int, default=None, help="Limit to the most recent N entries")
 
     # fsck
     subparsers.add_parser("fsck", help="Check repository integrity and object consistency")
@@ -135,6 +159,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Only remove from index, leave working tree file",
     )
+    rm_parser.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help="Discard uncommitted changes to the removed files instead of refusing",
+    )
 
     # restore
     restore_parser = subparsers.add_parser("restore", help="Restore working tree files or unstage from index")
@@ -146,6 +176,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     return parser
+
+
+def _to_repo_paths(user_paths: list[str], repo: Repository) -> list[str]:
+    """Translate caller-supplied paths into repository-relative POSIX paths.
+
+    The user's paths are relative to their shell's working directory, which is
+    not necessarily the repository root. Without this translation, running
+    `tiny-git add notes.txt` from `docs/` looks for `<repo>/notes.txt` instead
+    of `<repo>/docs/notes.txt`.
+
+    A bare "." keeps its meaning -- everything under the caller's directory --
+    by becoming that directory's repository-relative path.
+    """
+    resolved: list[str] = []
+    for raw in user_paths:
+        candidate = Path(raw)
+        if not candidate.is_absolute():
+            candidate = Path.cwd() / candidate
+        try:
+            rel = candidate.resolve().relative_to(repo.repo_root).as_posix()
+        except ValueError:
+            raise InvalidPathError(raw, "Path is outside repository") from None
+        resolved.append(rel if rel else ".")
+    return resolved
 
 
 def run_command(args: argparse.Namespace) -> int:
@@ -161,7 +215,7 @@ def run_command(args: argparse.Namespace) -> int:
     repo = Repository.find_repo(Path("."))
 
     if cmd == "add":
-        _ = repo.add(args.files)
+        _ = repo.add(_to_repo_paths(args.files, repo), force=args.force)
         return 0
 
     elif cmd == "commit":
@@ -173,7 +227,23 @@ def run_command(args: argparse.Namespace) -> int:
 
     elif cmd == "status":
         res = repo.status()
-        print(res.format())
+        if args.porcelain:
+            output = res.format_porcelain()
+            if output:
+                print(output)
+        elif args.short:
+            print(res.format_short())
+        else:
+            print(res.format())
+        return 0
+
+    elif cmd == "reflog":
+        reflog_entries = repo.reflog(max_count=args.max_count)
+        if not reflog_entries:
+            print("No reflog entries yet.")
+            return 0
+        for reflog_entry in reflog_entries:
+            print(reflog_entry.format())
         return 0
 
     elif cmd == "log":
@@ -195,7 +265,7 @@ def run_command(args: argparse.Namespace) -> int:
         return 0
 
     elif cmd == "checkout":
-        msg = repo.checkout(args.target)
+        msg = repo.checkout(args.target, force=args.force)
         print(msg)
         return 0
 
@@ -259,13 +329,13 @@ def run_command(args: argparse.Namespace) -> int:
         return 0
 
     elif cmd == "rm":
-        removed = repo.rm(args.files, cached=args.cached)
+        removed = repo.rm(_to_repo_paths(args.files, repo), cached=args.cached, force=args.force)
         for p in removed:
             print(f"rm '{p}'")
         return 0
 
     elif cmd == "restore":
-        _ = repo.restore(args.files, staged=args.staged)
+        _ = repo.restore(_to_repo_paths(args.files, repo), staged=args.staged)
         return 0
 
     return 1

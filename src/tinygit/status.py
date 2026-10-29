@@ -100,6 +100,74 @@ class StatusResult:
 
         return "\n".join(lines)
 
+    def porcelain_codes(self) -> dict[str, str]:
+        """Map each changed path to its two-character porcelain status code.
+
+        The first character is the index (staged) state, the second the working
+        tree state, matching `git status --porcelain`. A path can carry both,
+        e.g. `MM` for staged and unstaged modifications to the same file.
+        """
+        codes: dict[str, list[str]] = {}
+        unmerged = set(self.unmerged_paths)
+
+        def put(path: str, x: str | None = None, y: str | None = None) -> None:
+            slot = codes.setdefault(path, [" ", " "])
+            if x is not None:
+                slot[0] = x
+            if y is not None:
+                slot[1] = y
+
+        # A conflicted path has no stage-0 entry, so nothing else in this method
+        # would claim it. Lay the U code down first and skip the untracked pass
+        # for these paths, so the merge stays visible in the output.
+        for path in self.unmerged_paths:
+            put(path, "U", "U")
+        for path in self.staged_added:
+            put(path, x="A")
+        for path in self.staged_modified:
+            put(path, x="M")
+        for path in self.staged_deleted:
+            put(path, x="D")
+        for path in self.unstaged_modified:
+            put(path, y="M")
+        for path in self.unstaged_deleted:
+            put(path, y="D")
+        for path in self.untracked:
+            if path not in unmerged:
+                put(path, "?", "?")
+
+        return {path: "".join(xy) for path, xy in codes.items()}
+
+    def format_porcelain(self) -> str:
+        """Machine-readable status, one `XY <path>` line per changed path."""
+        codes = self.porcelain_codes()
+        if not codes:
+            return ""
+        return "\n".join(f"{codes[p]} {p}" for p in sorted(codes))
+
+    def format_short(self) -> str:
+        """Compact human-readable status (`git status --short`)."""
+        lines = []
+        if self.branch:
+            lines.append(f"## {self.branch}")
+        elif self.head_commit:
+            lines.append(f"## HEAD (detached at {self.head_commit[:7]})")
+        else:
+            lines.append("## No commits yet")
+
+        codes = self.porcelain_codes()
+        lines.extend(f"{codes[p]} {p}" for p in sorted(codes))
+
+        if self.unmerged_paths:
+            lines.append("")
+            lines.append("Unmerged paths: commit the resolution or run 'tiny-git merge --abort'.")
+        elif self.merge_head:
+            lines.append("")
+            lines.append(f"Merging {self.merge_branch or self.merge_head[:7]}.")
+        elif len(lines) == 1:
+            lines = [f"## {lines[0][3:]}", ""]
+        return "\n".join(lines)
+
 
 class StatusService:
     """Service for computing StatusResult across HEAD -> Index -> Working Tree."""
@@ -121,7 +189,7 @@ class StatusService:
             head_map = wt.get_tree_entries_flat(commit_obj.tree_id, store)
 
         index_map: dict[str, tuple[str, str]] = {
-            entry.path: (entry.object_id, entry.mode) for entry in index.list_entries()
+            entry.path: (entry.object_id, entry.mode) for entry in index.list_stage0_entries()
         }
 
         res = StatusResult(branch=branch, head_commit=head_commit)
@@ -140,31 +208,38 @@ class StatusService:
             except Exception:
                 pass
 
-        # 1. Compare HEAD -> INDEX for normal entries (stage 0)
-        for path, (sha, _) in index_map.items():
+        # 1. Compare HEAD -> INDEX for normal entries (stage 0).
+        # The mode is part of the comparison: toggling the executable bit with no
+        # edit to the bytes is a real staged change, and comparing object ids
+        # alone makes it invisible.
+        for path, staged_val in index_map.items():
             if path in res.unmerged_paths:
                 continue
             if path not in head_map:
                 res.staged_added.append(path)
-            elif sha != head_map[path][0]:
+            elif staged_val != head_map[path]:
                 res.staged_modified.append(path)
 
         for path in head_map:
-            if path not in index_map:
+            # index_map holds stage-0 entries only, so a conflicted path is
+            # absent from it. That absence is the conflict, not a staged
+            # deletion -- the unmerged guard keeps the two distinguishable.
+            if path not in index_map and path not in res.unmerged_paths:
                 res.staged_deleted.append(path)
 
         # 2. Compare INDEX -> WORKING TREE
-        disk_files = set(wt.list_files())
-        for path, (sha, _) in index_map.items():
+        disk_files = set(wt.list_files(always_include=index_map.keys()))
+        for path, index_val in index_map.items():
             if path not in disk_files:
                 res.unstaged_deleted.append(path)
             else:
-                disk_sha = wt.get_file_sha1(path)
-                if disk_sha is not None and disk_sha != sha:
+                disk_state = wt.get_file_state(path)
+                if disk_state is not None and disk_state != index_val:
                     res.unstaged_modified.append(path)
 
+        unmerged = set(res.unmerged_paths)
         for path in sorted(disk_files):
-            if path not in index_map:
+            if path not in index_map and path not in unmerged:
                 res.untracked.append(path)
 
         return res

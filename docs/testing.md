@@ -57,7 +57,7 @@ Parametrised over 10 distinct seeds, each running a 100-step randomized sequence
 ### 6. End-to-end & CLI contract (`test_end_to_end.py`, `test_cli_contract.py`)
 The full lifecycle through the Python `Repository` API and through `tinygit.cli.main()` called in-process, auditing human-readable error messages, non-zero exit codes, and the absence of raw tracebacks in user-facing output.
 
-> **Note.** No test currently spawns the installed `tiny-git` entry point as a real subprocess — `grep -rn subprocess tests/` returns nothing. The contract tests call `main()` directly, which covers argument parsing and exit codes but not console-script wiring or `PYTHONPATH` setup. Adding a genuine subprocess smoke test (`python -m tinygit status` via `sys.executable`) is an open gap, and it is also the natural place to catch cross-platform argv and encoding differences.
+> **Note.** No test yet spawns the installed `tiny-git` entry point as a real subprocess. `tests/test_audit_locking_lifecycle.py` does use `subprocess.Popen`, but it launches `sys.executable` workers that drive the library in-process, to prove the file lock actually serialises real processes. The contract tests call `main()` directly, which covers argument parsing and exit codes but not console-script wiring or `PYTHONPATH` setup. Adding a genuine subprocess smoke test (`python -m tinygit status` via `sys.executable`) is an open gap, and it is also the natural place to catch cross-platform argv and encoding differences.
 
 ### 7. Git-compatibility & encoding (`test_git_compatibility.py`, `test_symlink_encoding.py`)
 Guards the shared conceptual surface (hashing scheme, HEAD syntax, diff and conflict-marker formats) and the byte-oriented storage policy that rejects symlinks.
@@ -66,10 +66,17 @@ Guards the shared conceptual surface (hashing scheme, HEAD syntax, diff and conf
 
 ## Suite Inventory
 
-Snapshot of the collected suite, taken on 2026-10-10 with Python 3.11.2 / pytest 9.1.1. Regenerate it with the `--collect-only` command above — treat this table as a map, not as a live count.
+Snapshot of the collected suite, taken on 2026-10-29 with Python 3.11.2 / pytest 9.1.1. The seven `test_audit_*` modules are the regression suite for the audit described in the [Unreleased changelog entry](../CHANGELOG.md); each was checked to fail against the pre-fix code. Regenerate it with the `--collect-only` command above — treat this table as a map, not as a live count.
 
 | Test module | Tests | Area |
 | :--- | :-: | :--- |
+| `test_audit_ref_validation.py` | 45 | Branch/ref name validation |
+| `test_audit_additions.py` | 43 | `.tinygitignore`, reflog, porcelain status |
+| `test_audit_modes_paths_fsck.py` | 40 | Exec modes, path resolution, `fsck` hardening |
+| `test_audit_tree_and_checkout.py` | 27 | Tree entry validation, checkout safety |
+| `test_audit_rm_and_merge.py` | 22 | `rm` protection, merge index/stages/bytes/LCA |
+| `test_audit_locking_lifecycle.py` | 21 | Locking, CAS refs, merge lifecycle |
+| `test_audit_failure_injection.py` | 13 | Interrupted multi-file operations |
 | `test_merge_matrix.py` | 11 | Merge scenarios |
 | `test_state_machine.py` | 10 | Randomised invariant fuzzing |
 | `test_objects.py` | 6 | Content-addressed storage |
@@ -101,7 +108,7 @@ Snapshot of the collected suite, taken on 2026-10-10 with Python 3.11.2 / pytest
 | `test_fsck_adversarial.py` | 1 | Corruption detection |
 | `test_commit.py` | 1 | Commit creation |
 | `test_cat_file_show.py` | 1 | Object inspection |
-| **31 modules** | **98** | |
+| **38 modules** | **309** | |
 
 ---
 
